@@ -26,6 +26,7 @@
 #include <thread>      // std::this_thread, std::thread
 #include <type_traits> // std::common_type_t, std::decay_t, std::enable_if_t, std::is_void_v, std::invoke_result_t
 #include <utility>     // std::move
+#include <condition_variable>
 
 // ============================================================================================= //
 //                                    Begin class thread_pool                                    //
@@ -37,6 +38,13 @@ class thread_pool
 {
     typedef std::uint_fast32_t ui32;
     typedef std::uint_fast64_t ui64;
+
+    struct Status {
+        bool waked_;
+        std::mutex lock_;
+        std::condition_variable cv_;
+        Status():waked_(false){};
+    };
 
 public:
     // ============================
@@ -175,6 +183,17 @@ public:
         {
             const std::scoped_lock lock(queue_mutex);
             tasks.push(std::function<void()>(task));
+        }
+        int i;
+        for (i=0;i<thread_count;i++) {
+            std::unique_lock lock(vec_thread_status[i]->lock_);
+            if (!vec_thread_status[i]->waked_) {
+                vec_thread_status[i]->waked_ = true;
+                break;
+            }
+        }
+        if ( i < thread_count ) {
+            vec_thread_status[i]->cv_.notify_one();
         }
     }
 
@@ -328,9 +347,11 @@ private:
      */
     void create_threads()
     {
+        vec_thread_status.clear();
         for (ui32 i = 0; i < thread_count; i++)
         {
-            threads[i] = std::thread(&thread_pool::worker, this);
+            vec_thread_status.push_back(std::make_unique<Status>());
+            threads[i] = std::thread(&thread_pool::worker, this, i);
         }
     }
 
@@ -341,6 +362,10 @@ private:
     {
         for (ui32 i = 0; i < thread_count; i++)
         {
+            std::unique_lock lock(vec_thread_status[i]->lock_);
+            vec_thread_status[i]->waked_ = true;
+            lock.unlock();
+            vec_thread_status[i]->cv_.notify_one();
             threads[i].join();
         }
     }
@@ -379,20 +404,32 @@ private:
     /**
      * @brief A worker function to be assigned to each thread in the pool. Continuously pops tasks out of the queue and executes them, as long as the atomic variable running is set to true.
      */
-    void worker()
+    void worker(int thread_ndx)
     {
         while (running)
         {
-            std::function<void()> task;
-            if (!paused && pop_task(task))
-            {
-                task();
-                tasks_total--;
+            std::unique_lock<std::mutex> lock(vec_thread_status[thread_ndx]->lock_);
+            vec_thread_status[thread_ndx]->cv_.wait(lock,[=](){ return vec_thread_status[thread_ndx]->waked_;});
+            lock.unlock();
+            while(running){
+                std::function<void()> task;
+                if(paused){
+                    sleep_or_yield();
+                    continue;
+                }
+                if (pop_task(task))
+                {
+                    task();
+                    tasks_total--;
+                }
+                else
+                {
+                    break;
+                }
             }
-            else
-            {
-                sleep_or_yield();
-            }
+            lock.lock();
+            vec_thread_status[thread_ndx]->waked_ = false;
+            lock.unlock();
         }
     }
 
@@ -424,6 +461,8 @@ private:
      * @brief A smart pointer to manage the memory allocated for the threads.
      */
     std::unique_ptr<std::thread[]> threads;
+
+    std::vector<std::unique_ptr<Status>> vec_thread_status;
 
     /**
      * @brief An atomic variable to keep track of the total number of unfinished tasks - either still in the queue, or running in a thread.
